@@ -26,7 +26,7 @@ struct SegmentTemplate {
 #[derive(Default)]
 struct Representation {
     id: String,
-    bandwidth: String,
+    bandwidth: u64,
     segment_template: Option<SegmentTemplate>,
 }
 
@@ -167,9 +167,10 @@ fn parse_representation(node: roxmltree::Node) -> Representation {
     }
 
     match node.attribute("bandwidth") {
-        Some(bandwidth) => {
-            representation.bandwidth = bandwidth.to_owned();
-        }
+        Some(bandwidth) => match bandwidth.parse() {
+            Ok(val) => representation.bandwidth = val,
+            Err(_) => eprintln!("Could not parse bandwidth of representation"),
+        },
         None => {
             eprintln!("Could not find bandwidth of representation")
         }
@@ -270,6 +271,43 @@ struct FragementDescriptor<'a> {
     repeat: u64,
 }
 
+fn replace_with_printf_format(template: String, identifier: &str, value: u64) -> String {
+    let mut ret: String = template.clone();
+    let mut token_started = false;
+    let mut token: String = Default::default();
+    for c in template.chars() {
+        if c == '$' {
+            if token_started {
+                if token.starts_with(identifier) {
+                    let updated: String;
+                    match token.len() == identifier.len() {
+                        true => {
+                            updated = sprintf::sprintf!("%llu", value).unwrap();
+                        }
+                        false => {
+                            let fmt = token.strip_prefix(identifier).unwrap();
+                            updated = sprintf::sprintf!(fmt, value).unwrap();
+                        }
+                    }
+                    let mut replacement: String = "$".to_owned();
+                    replacement.push_str(&token);
+                    replacement.push('$');
+                    ret = ret.replace(&replacement, &updated);
+                }
+                token_started = false;
+                token.clear();
+            } else {
+                token_started = true;
+            }
+        } else {
+            if token_started {
+                token.push(c);
+            }
+        }
+    }
+    return ret;
+}
+
 fn expand_segment_template(
     template_string: &str,
     fragement_descriptor: &FragementDescriptor,
@@ -280,12 +318,13 @@ fn expand_segment_template(
         "$RepresentationID$",
         &fragement_descriptor.representation.id,
     );
-    ret = ret.replace("$Number$", &fragement_descriptor.number.to_string());
-    ret = ret.replace(
-        "$Bandwidth$",
-        &fragement_descriptor.representation.bandwidth,
+    ret = replace_with_printf_format(ret, "Number", fragement_descriptor.number);
+    ret = replace_with_printf_format(
+        ret,
+        "Bandwidth",
+        fragement_descriptor.representation.bandwidth,
     );
-    ret = ret.replace("$Time$", &fragement_descriptor.time.to_string());
+    ret = replace_with_printf_format(ret, "Time", fragement_descriptor.time);
     return ret;
 }
 
@@ -445,6 +484,44 @@ pub fn get_fragment_urls(xml_text: String, url: &str) -> Option<UrlInfo> {
 mod tests {
     use crate::mpd::get_fragment_urls;
 
+    use crate::mpd::expand_segment_template;
+    use crate::mpd::FragementDescriptor;
+
+    use super::Representation;
+
+    #[test]
+    fn expand_segment_template_test_1() {
+        let mut representation: Representation = Default::default();
+        representation.id = "repId".to_owned();
+        representation.bandwidth = 12345;
+        let mut template_string = "$RepresentationID$/$Number%06d$.m4s";
+        let fragement_descriptor = FragementDescriptor {
+            number: 1,
+            representation: &representation,
+            time: 123,
+            repeat: 0,
+        };
+        assert_eq!(
+            expand_segment_template(template_string, &fragement_descriptor),
+            "repId/000001.m4s"
+        );
+        template_string = "$RepresentationID$/$Time%05d$.m4s";
+        assert_eq!(
+            expand_segment_template(template_string, &fragement_descriptor),
+            "repId/00123.m4s"
+        );
+        template_string = "$RepresentationID$/$Bandwidth%07d$.m4s";
+        assert_eq!(
+            expand_segment_template(template_string, &fragement_descriptor),
+            "repId/0012345.m4s"
+        );
+        template_string = "$RepresentationID$/$Bandwidth%07d$$Time%05d$$Number%06d$.m4s";
+        assert_eq!(
+            expand_segment_template(template_string, &fragement_descriptor),
+            "repId/001234500123000001.m4s"
+        );
+    }
+
     #[test]
     fn segment_template_timeline_1() {
         let xml_text = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -461,7 +538,7 @@ mod tests {
                             </AdaptationSet>
                             </Period>
                             </MPD>"#.to_owned();
-        let url_info_opt = get_fragment_urls(xml_text, "http://test.com/");
+        let url_info_opt = get_fragment_urls(xml_text, "http://test.com/manifest.mpd");
         assert!(url_info_opt.is_some());
         if let Some(url_info) = url_info_opt {
             assert_eq!(url_info.urls.len(), 3);
