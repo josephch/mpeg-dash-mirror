@@ -28,6 +28,7 @@ struct Representation {
     id: String,
     bandwidth: u64,
     segment_template: Option<SegmentTemplate>,
+    base_url: Option<String>,
 }
 
 #[derive(Default)]
@@ -35,6 +36,7 @@ struct AdaptationSet {
     mime_type: String,
     segment_template: Option<SegmentTemplate>,
     representations: Vec<Representation>,
+    base_url: Option<String>,
 }
 
 #[derive(Default)]
@@ -48,6 +50,7 @@ struct MpegDash {
     periods: Vec<Period>,
     url: String,
     media_presentation_duration: Option<f32>,
+    base_url: Option<String>,
 }
 
 impl MpegDash {
@@ -176,10 +179,17 @@ fn parse_representation(node: roxmltree::Node) -> Representation {
         }
     }
 
-    for child in node.descendants() {
+    for child in node.children() {
         if child.has_tag_name("SegmentTemplate") {
             representation.segment_template = check_and_parse_segment_template(child);
             break;
+        } else if child.has_tag_name("BaseURL") {
+            match child.text() {
+                Some(content) => representation.base_url = Some(content.to_owned()),
+                None => {
+                    eprintln!("could not get base_url for representation");
+                }
+            }
         }
     }
     return representation;
@@ -195,12 +205,19 @@ fn parse_adaptation_set(node: roxmltree::Node) -> AdaptationSet {
             eprintln!("Could not find mimeType of adaptation set")
         }
     }
-    for child in node.descendants() {
+    for child in node.children() {
         if child.has_tag_name("Representation") {
             let representation = parse_representation(child);
             adaptation_set.representations.push(representation);
         } else if child.has_tag_name("SegmentTemplate") {
             adaptation_set.segment_template = Some(parse_segment_template(child));
+        } else if child.has_tag_name("BaseURL") {
+            match child.text() {
+                Some(content) => adaptation_set.base_url = Some(content.to_owned()),
+                None => {
+                    eprintln!("could not get base_url for adaptation set");
+                }
+            }
         }
     }
     return adaptation_set;
@@ -237,25 +254,37 @@ fn parse_mpd(xml: String, url: String) -> MpegDash {
     let result = roxmltree::Document::parse(&xml);
     match result {
         Ok(doc) => {
-            for node in doc.descendants() {
-                if node.is_element() {
-                    if node.has_tag_name("Period") {
-                        let period = parse_period(node);
-                        mpeg_dash.insert(period);
-                    } else if node.has_tag_name("MPD") {
-                        match get_optional_attibute_from_node(&node, "mediaPresentationDuration") {
-                            Some(duration) => {
-                                mpeg_dash.media_presentation_duration = duration
-                                    .parse::<iso8601_duration::Duration>()
-                                    .unwrap()
-                                    .num_seconds();
-                            }
-                            None => {
-                                debug_println!("mediaPresentationDuration not available in MPD");
+            let root_element = doc.root_element();
+            match root_element.has_tag_name("MPD") {
+                true => {
+                    match get_optional_attibute_from_node(
+                        &root_element,
+                        "mediaPresentationDuration",
+                    ) {
+                        Some(duration) => {
+                            mpeg_dash.media_presentation_duration = duration
+                                .parse::<iso8601_duration::Duration>()
+                                .unwrap()
+                                .num_seconds();
+                        }
+                        None => {
+                            debug_println!("mediaPresentationDuration not available in MPD");
+                        }
+                    }
+                    for child in root_element.children() {
+                        if child.has_tag_name("Period") {
+                            let period = parse_period(child);
+                            mpeg_dash.insert(period);
+                        } else if child.has_tag_name("BaseURL") {
+                            match child.text() {
+                                Some(content) => mpeg_dash.base_url = Some(content.to_owned()),
+                                //Some(_) => todo!(),
+                                None => mpeg_dash.base_url = None,
                             }
                         }
                     }
                 }
+                false => eprintln!("Not valid dash, root node is not MPD"),
             }
             mpeg_dash.url = url;
         }
@@ -338,9 +367,23 @@ fn get_urls(mpd: MpegDash) -> Option<UrlInfo> {
     let mut ret: UrlInfo = UrlInfo {
         ..Default::default()
     };
-    let base_url: String;
-    let pos = mpd.url.rfind('/')?;
-    base_url = mpd.url[..pos + 1].to_string();
+    let base_url = match mpd.base_url {
+        Some(mpd_base_url) => {
+            match mpd_base_url.starts_with("http://") || mpd_base_url.starts_with("https://") {
+                true => mpd_base_url,
+                false => {
+                    let pos = mpd.url.rfind('/')?;
+                    let mut base_url_appended = mpd.url[..pos + 1].to_string();
+                    base_url_appended.push_str(&mpd_base_url);
+                    base_url_appended
+                }
+            }
+        }
+        None => {
+            let pos = mpd.url.rfind('/')?;
+            mpd.url[..pos + 1].to_string()
+        }
+    };
 
     let periods_iter = mpd.periods.iter();
     for (period_idx, period) in periods_iter.enumerate() {
@@ -385,6 +428,12 @@ fn get_urls(mpd: MpegDash) -> Option<UrlInfo> {
                         match &segment_template.initialization {
                             Some(initialization) => {
                                 let mut initialization_url = base_url.clone();
+                                if let Some(adaptation_set_base_url) = &adaptation_set.base_url {
+                                    initialization_url.push_str(adaptation_set_base_url);
+                                }
+                                if let Some(representation_base_url) = &representation.base_url {
+                                    initialization_url.push_str(representation_base_url);
+                                }
                                 initialization_url.push_str(&expand_segment_template(
                                     &initialization,
                                     &fragment_descriptor,
@@ -408,6 +457,16 @@ fn get_urls(mpd: MpegDash) -> Option<UrlInfo> {
                                         fragment_descriptor.repeat = s.r;
                                         loop {
                                             let mut segment_url = base_url.clone();
+                                            if let Some(adaptation_set_base_url) =
+                                                &adaptation_set.base_url
+                                            {
+                                                segment_url.push_str(adaptation_set_base_url);
+                                            }
+                                            if let Some(representation_base_url) =
+                                                &representation.base_url
+                                            {
+                                                segment_url.push_str(representation_base_url);
+                                            }
                                             segment_url.push_str(&expand_segment_template(
                                                 media,
                                                 &fragment_descriptor,
@@ -430,6 +489,16 @@ fn get_urls(mpd: MpegDash) -> Option<UrlInfo> {
                                     }
                                     loop {
                                         let mut segment_url = base_url.clone();
+                                        if let Some(adaptation_set_base_url) =
+                                            &adaptation_set.base_url
+                                        {
+                                            segment_url.push_str(adaptation_set_base_url);
+                                        }
+                                        if let Some(representation_base_url) =
+                                            &representation.base_url
+                                        {
+                                            segment_url.push_str(representation_base_url);
+                                        }
                                         segment_url.push_str(&expand_segment_template(
                                             media,
                                             &fragment_descriptor,
@@ -564,6 +633,7 @@ mod tests {
     fn segment_template_no_timeline_1() {
         let xml_text = r#"<?xml version="1.0"?>
         <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT0H0M60.000S">
+        <BaseURL>https://baseurl.net/abcde/fgh/</BaseURL>
          <Period duration="PT0H0M60.000S">
           <AdaptationSet>
            <Representation id="1" mimeType="video/mp4" bandwidth="5678742">
@@ -582,15 +652,48 @@ mod tests {
             assert!(url_info
                 .urls
                 .iter()
-                .any(|url| url == "http://test.com/video_8000k_init.mp4"));
+                .any(|url| url == "https://baseurl.net/abcde/fgh/video_8000k_init.mp4"));
             assert!(url_info
                 .urls
                 .iter()
-                .any(|url| url == "http://test.com/video_8000k_1.mp4"));
+                .any(|url| url == "https://baseurl.net/abcde/fgh/video_8000k_1.mp4"));
             assert!(url_info
                 .urls
                 .iter()
-                .any(|url| url == "http://test.com/video_8000k_30.mp4"));
+                .any(|url| url == "https://baseurl.net/abcde/fgh/video_8000k_30.mp4"));
+        }
+    }
+    #[test]
+    fn segment_template_no_timeline_baseurl_1() {
+        let xml_text = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <MPD type="static"  mediaPresentationDuration="PT9M32.520S">
+        <Period duration="PT9M32.520S" start="PT0S">
+            <AdaptationSet id="3" mimeType="audio/mp4" >
+                <BaseURL>audio/</BaseURL>
+                <SegmentTemplate timescale="1000" duration="3840" media="$RepresentationID$/$Number%06d$.m4s" initialization="$RepresentationID$/IS.mp4" />
+                <Representation id="160kbps" bandwidth="160000" />
+                <Representation id="96kbps" bandwidth="96000" />
+            </AdaptationSet>
+        </Period>
+        </MPD>"#.to_owned();
+        let url_info_opt = get_fragment_urls(xml_text, "http://test.com/");
+        assert!(url_info_opt.is_some());
+        if let Some(url_info) = url_info_opt {
+            for url in url_info.urls.iter() {
+                println!("url : {}", url);
+            }
+            assert!(url_info
+                .urls
+                .iter()
+                .any(|url| url == "http://test.com/audio/160kbps/IS.mp4"));
+            assert!(url_info
+                .urls
+                .iter()
+                .any(|url| url == "http://test.com/audio/160kbps/000010.m4s"));
+            assert!(url_info
+                .urls
+                .iter()
+                .any(|url| url == "http://test.com/audio/96kbps/000010.m4s"));
         }
     }
 }
