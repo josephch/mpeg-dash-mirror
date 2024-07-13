@@ -17,7 +17,7 @@ git clone https://github.com/josephch/mpeg-dash-mirror.git
 ### Build and run the source
 
 ```
-cargo run -- --url <url> -o <output directory>
+cargo run --release -- --url <url> -o <output directory>
 ```
 
 ## Authors
